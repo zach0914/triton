@@ -84,6 +84,60 @@ class ASTSource:
         return dict()
 
 
+class ASTSourceBatch:
+    """Lower multiple AST sources into one TTIR module and verify once at the end.
+
+    This is intentionally a TTIR-only helper.  In particular, the resulting
+    multi-entry module is not a valid input to backend pipelines that require a
+    single public kernel entry.
+    """
+
+    def __init__(self, target: GPUTarget, *, context=None, module=None) -> None:
+        if not isinstance(target, GPUTarget):
+            raise TypeError("target must be of GPUTarget type")
+        self.target = target
+        self.backend = make_backend(target)
+        self.context = ir.context() if context is None else context
+        ir.load_dialects(self.context)
+        self.backend.load_dialects(self.context)
+        self.module = module
+        self._function_types = {}
+
+    def add(self, source: ASTSource, *, entry_name: str, visibility: str = "private", options=None,
+            parsed_options=None):
+        """Append one AST source without verifying the temporarily incomplete module."""
+        if not isinstance(source, ASTSource):
+            raise TypeError("source must be an ASTSource")
+        if visibility not in ("private", "public"):
+            raise ValueError("visibility must be 'private' or 'public'")
+        if parsed_options is None:
+            parsed_options = self.backend.parse_options(dict(options or {}, **source.parse_options()))
+        codegen_fns = self.backend.get_codegen_implementation(parsed_options)
+        module_map = self.backend.get_module_map()
+        from .code_generator import ast_to_ttir
+        self.module = ast_to_ttir(
+            source.fn,
+            source,
+            context=self.context,
+            options=parsed_options,
+            codegen_fns=codegen_fns,
+            module_map=module_map,
+            module=self.module,
+            function_name=entry_name,
+            visibility=visibility,
+            function_types=self._function_types,
+            verify=False,
+        )
+        return self.module
+
+    def verify(self):
+        if self.module is None:
+            raise ValueError("cannot verify an empty AST source batch")
+        if not self.module.verify():
+            raise RuntimeError("error encountered while verifying batched TTIR")
+        return self.module
+
+
 class IRSource:
 
     def __init__(self, path, context, backend):

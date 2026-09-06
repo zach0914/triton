@@ -1,0 +1,12 @@
+set(MLIR_BINARY_DIR ${CMAKE_BINARY_DIR})
+
+set(LLVM_TARGET_DEFINITIONS TimelyOps.td)
+mlir_tablegen(Dialect.h.inc -gen-dialect-decls -dialect=tm)
+mlir_tablegen(Dialect.cpp.inc -gen-dialect-defs -dialect=tm)
+mlir_tablegen(Ops.h.inc -gen-op-decls)
+mlir_tablegen(Ops.cpp.inc -gen-op-defs)
+mlir_tablegen(Types.h.inc -gen-typedef-decls -typedefs-dialect=tm)
+mlir_tablegen(Types.cpp.inc -gen-typedef-defs -typedefs-dialect=tm)
+add_mlir_doc(TimelyDialect TimelyDialect dialects/ -gen-dialect-doc -dialect=tm)
+add_mlir_doc(TimelyOps TimelyOps dialects/ -gen-op-doc -dialect=tm)
+add_public_tablegen_target(TimelyTableGen)

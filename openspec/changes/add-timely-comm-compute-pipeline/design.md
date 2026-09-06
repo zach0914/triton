@@ -7,8 +7,9 @@
 **Goals:**
 
 - 建立可运行的 `Timely Python -> TM IR -> 时间/依赖/资源分析 -> 执行计划 -> Triton kernel/runtime` 路径。
+- 让 native `tm.plan` 成为执行计划的唯一事实来源，通过结构化 Python binding 驱动所有 executor。
 - 让调度参数独立进入逻辑时间公式，同时通过 SSA、通信契约和前端 annotation 建立固有依赖。
-- 根据固有依赖插入同步，并根据目标容量规划 SM、线程、共享内存和通信资源。
+- 根据固有依赖生成同步计划，保留资源需求并用可替换的保守策略支撑 MVP 执行。
 - 保持 TM 语义与 Triton 的具体流水和后端实现解耦。
 
 **Non-Goals:**
@@ -50,7 +51,7 @@
 
 用户公式产生发射键 `T(v)=t0+f(index,consts)`。编译器只保留所有任务之间的 `<`、`=`、`>` 关系，并将不同键保序压缩为连续 rank；因此只有两个时间层时，间隔 `1` 与 `100` 等价。`LAG` 只有在改变任务相对交错关系时才改变调度，不表示 GPU 周期。
 
-相同 rank 的任务同时进入可发射集合，不获得额外时间顺序。例如 `AG1` 与 `GEMM0` 同层时二者均可提交；`AG1` 可以推进，`GEMM0` 通过 `DataDep(AG0,GEMM0)` 等待 `AG0` 完成。
+相同 rank 的任务不获得彼此之间的额外时间顺序。第一层立即开放；后续逻辑层只有在前一层至少一个任务执行完成后才开放。层开放后，每个任务仍必须等待自己的全部 `DataDep` 和 `ResourceOrder` 前驱完成。例如 `AG1` 与 `GEMM0` 同层时，前一层完成门槛满足后两者均可提交，且各自的依赖条件仍独立生效。
 
 ### 5. Build dependencies before planning and reject time conflicts
 
@@ -64,7 +65,7 @@ task 内部优先复用 Triton 的 `MemoryEffectOpInterface`、alias、buffer-re
 
 合法图先按稠密化 `TimeOrder` 生成发射层。同层节点的稳定 tie-break 只用于 IR 和测试复现，不构成语义边。
 
-每个 task 保留资源需求摘要，包括执行资源类别、线程/warp 数和共享内存等。资源规划 pass 根据目标容量和执行 scope 分配资源，并在必要时增加单独标记的 `ResourceOrder` 边。资源冲突可以延迟实际执行，但不得改变逻辑时间层或删除 `DataDep`。
+每个 task 保留资源需求摘要，包括执行资源类别、线程/warp 数和共享内存等。当前 TM 高层只检查单任务请求不超过目标可表示上限，并在同层、同资源类别内生成确定性的保守 `ResourceOrder` 链，作为足以驱动 MVP 的占位策略。精确资源竞争、occupancy 和 placement 留给后续目标相关阶段；替换资源策略不得改变逻辑时间层或删除 `DataDep`。
 
 Pass 边界为：
 
@@ -95,11 +96,28 @@ Timely Python
 
 备选方案是将 `allgather` 直接 lowering 为 TTIR。通用 Triton IR 没有跨 GPU collective 语义，这会过早绑定 NVSHMEM、特定远端内存或目标指令，因此不采用。后续可为同一通信接口增加 NCCL host backend 或 device-side backend。
 
-### 9. Preserve a future conventional-loop fallback boundary
+### 9. Native tm.plan is the sole plan source
+
+`GraphBuilder` 只负责生成带 task id 的 TM MLIR，并保留 `task id -> @tm.task/Triton kernel` 注册表。native pass pipeline 产生的 `tm.plan` 包含 `issue_layers`、`DataDep`、`ResourceOrder` 和 `synchronizations`，随后由结构化 Python binding 转换为 `PlanDescriptor`。
+
+reference executor 和 CUDA executor 只消费 `PlanDescriptor` 与 task registry，不重新扫描 task 的 reads/writes、推导依赖或规划资源。Python 可以负责将 descriptor 中已确定的关系物化为 Future、CUDA stream/event 和 launch，但不得产生新的语义边。
+
+目标链路为：
+
+```text
+GraphBuilder -> TM MLIR -> native passes -> tm.plan
+             -> PlanDescriptor binding -> Python executor
+```
+
+### 10. Gate each issue layer on progress of the previous layer
+
+逻辑层 `L0` 无时间门槛。对于后续层 `Li`，executor 必须先观察到 `Li-1` 中至少一个任务完成，才开放 `Li`。这是 `issue_layers` 的执行语义，不表现为任意选定任务之间的 `DataDep` 或 `ResourceOrder`，也不要求等待前一层全部完成。
+
+### 11. Preserve a future conventional-loop fallback boundary
 
 本次不实现普通循环回退，但 TM task graph 保留与时间公式分离的 domain、计算体、依赖和资源摘要。未来可增加另一种 planning policy，忽略用户时间映射并从依赖图生成常规循环；该策略不得成为首版合法性检查失败后的静默回退。
 
-### 10. Verify overlap through plan structure and an observable reference runtime
+### 12. Verify overlap through plan structure and an observable reference runtime
 
 编译测试分别检查稠密发射层、三类 graph edges、资源可行性和必要同步；运行测试比较串行 reference 数值结果。reference 通信后端支持可控延迟和执行轨迹，以确定性地证明 `comm(q+1)` 在 `compute(q)` 完成前已发射，而不依赖短 kernel 的偶然计时结果。
 
@@ -110,6 +128,8 @@ Timely Python
 - [逻辑时间被误解为物理延迟] -> IR 与诊断明确区分 TimeOrder、DataDep、ResourceOrder 和 completion event。
 - [用户 annotation 不完整或错误] -> 与可推导 SSA/effect 事实交叉验证，无法证明时保守报错。
 - [首版资源模型过粗导致计划次优] -> 允许合法但非最优计划，保持资源 planner 接口可替换。
+- [前层任一完成门槛需要运行期观察完成状态] -> reference runtime 等待任一 Future；CUDA MVP 在 host 端查询 completion event，只开放下一层而不添加伪数据依赖。
+- [native 与 Python 计划语义漂移] -> 删除 Python 侧分析，测试 `PlanDescriptor` 与打印出的 `tm.plan` 字段一致。
 - [过早侵入 TritonGPU 导致维护成本上升] -> TM 在 TTIR/运行时边界前完全消解，首版不改现有 pipeline 算法。
 
 ## Migration Plan

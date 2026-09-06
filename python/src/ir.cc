@@ -39,11 +39,13 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
+#include "triton/Dialect/Timely/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/PluginUtils.h"
 #include "triton/Tools/Sys/Dump.h"
 #include "triton/Tools/Sys/GetEnv.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/SourceMgr.h"
 #include <memory>
 
@@ -55,6 +57,7 @@ using namespace triton;
 namespace tt = triton;
 namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
+namespace tmt = triton::timely;
 
 // Function to parse a comma-separated string into a vector of C-style strings
 llvm::SmallVector<const char *, 3>
@@ -234,6 +237,131 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
   return result;
 }
 
+StringAttr requireStringAttr(DictionaryAttr dictionary, StringRef name,
+                             StringRef recordKind) {
+  auto value = dyn_cast_or_null<StringAttr>(dictionary.get(name));
+  if (!value)
+    throw std::runtime_error(("malformed tm.plan " + recordKind +
+                              ": missing string field '" + name + "'")
+                                 .str());
+  return value;
+}
+
+IntegerAttr requireIntegerAttr(DictionaryAttr dictionary, StringRef name,
+                               StringRef recordKind) {
+  auto value = dyn_cast_or_null<IntegerAttr>(dictionary.get(name));
+  if (!value)
+    throw std::runtime_error(("malformed tm.plan " + recordKind +
+                              ": missing integer field '" + name + "'")
+                                 .str());
+  return value;
+}
+
+ArrayAttr requireArrayAttr(DictionaryAttr dictionary, StringRef name,
+                           StringRef recordKind) {
+  auto value = dyn_cast_or_null<ArrayAttr>(dictionary.get(name));
+  if (!value)
+    throw std::runtime_error(("malformed tm.plan " + recordKind +
+                              ": missing array field '" + name + "'")
+                                 .str());
+  return value;
+}
+
+py::dict convertTimelyEdge(Attribute attribute, StringRef recordKind) {
+  auto dictionary = dyn_cast<DictionaryAttr>(attribute);
+  if (!dictionary)
+    throw std::runtime_error(
+        ("malformed tm.plan " + recordKind + ": expected dictionary").str());
+  py::dict result;
+  result["source"] = requireStringAttr(dictionary, "from", recordKind)
+                         .getValue()
+                         .str();
+  result["target"] =
+      requireStringAttr(dictionary, "to", recordKind).getValue().str();
+  result["kind"] =
+      requireStringAttr(dictionary, "kind", recordKind).getValue().str();
+  return result;
+}
+
+py::dict getTimelyPlanDescriptor(ModuleOp &module) {
+  SmallVector<tmt::PlanOp> plans;
+  module.walk([&](tmt::PlanOp plan) { plans.push_back(plan); });
+  if (plans.size() != 1)
+    throw std::runtime_error("expected exactly one native tm.plan operation");
+  tmt::PlanOp plan = plans.front();
+
+  py::list nodes;
+  for (Attribute attribute : plan.getNodes()) {
+    auto dictionary = dyn_cast<DictionaryAttr>(attribute);
+    if (!dictionary)
+      throw std::runtime_error("malformed tm.plan node: expected dictionary");
+    py::dict node;
+    node["id"] = requireStringAttr(dictionary, "id", "node").getValue().str();
+    node["kind"] =
+        requireStringAttr(dictionary, "kind", "node").getValue().str();
+    node["callee"] =
+        requireStringAttr(dictionary, "callee", "node").getValue().str();
+    node["specialization"] =
+        requireStringAttr(dictionary, "specialization", "node")
+            .getValue()
+            .str();
+    node["raw_time"] =
+        requireIntegerAttr(dictionary, "raw_time", "node").getInt();
+    node["issue_rank"] =
+        requireIntegerAttr(dictionary, "issue_rank", "node").getInt();
+    nodes.append(std::move(node));
+  }
+
+  py::list issueLayers;
+  for (Attribute attribute : plan.getIssueLayers()) {
+    auto dictionary = dyn_cast<DictionaryAttr>(attribute);
+    if (!dictionary)
+      throw std::runtime_error(
+          "malformed tm.plan issue layer: expected dictionary");
+    py::dict layer;
+    layer["rank"] =
+        requireIntegerAttr(dictionary, "rank", "issue layer").getInt();
+    py::list tasks;
+    for (Attribute task : requireArrayAttr(dictionary, "tasks", "issue layer")) {
+      auto taskId = dyn_cast<StringAttr>(task);
+      if (!taskId)
+        throw std::runtime_error(
+            "malformed tm.plan issue layer: task id must be a string");
+      tasks.append(taskId.getValue().str());
+    }
+    layer["tasks"] = std::move(tasks);
+    issueLayers.append(std::move(layer));
+  }
+
+  auto convertEdges = [&](ArrayAttr attributes, StringRef recordKind) {
+    py::list result;
+    for (Attribute attribute : attributes)
+      result.append(convertTimelyEdge(attribute, recordKind));
+    return result;
+  };
+
+  py::list synchronizations;
+  for (Attribute attribute : plan.getSynchronizations()) {
+    py::dict synchronization = convertTimelyEdge(attribute, "synchronization");
+    auto dictionary = cast<DictionaryAttr>(attribute);
+    synchronization["scope"] =
+        requireStringAttr(dictionary, "scope", "synchronization")
+            .getValue()
+            .str();
+    synchronizations.append(std::move(synchronization));
+  }
+
+  py::dict result;
+  result["nodes"] = std::move(nodes);
+  result["issue_layers"] = std::move(issueLayers);
+  result["time_order"] = convertEdges(plan.getTimeOrder(), "time edge");
+  result["data_deps"] = convertEdges(plan.getDataDeps(), "data edge");
+  result["resource_order"] =
+      convertEdges(plan.getResourceOrder(), "resource edge");
+  result["synchronizations"] = std::move(synchronizations);
+  return result;
+}
+
 } // anonymous namespace
 
 /*****************************************************************************/
@@ -365,6 +493,7 @@ void init_triton_ir(py::module_ &m) {
 
     registry.insert<TritonDialect, ::mlir::triton::gpu::TritonGPUDialect,
                     ::mlir::triton::instrument::TritonInstrumentDialect,
+                    ::mlir::triton::timely::TimelyDialect,
                     ::mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect,
                     math::MathDialect, arith::ArithDialect, scf::SCFDialect,
                     ::mlir::gpu::GPUDialect, cf::ControlFlowDialect,
@@ -714,6 +843,38 @@ void init_triton_ir(py::module_ &m) {
            [](ModuleOp &self, FuncOp &funcOp) -> void {
              self.push_back(funcOp);
            })
+      .def("merge_functions_from",
+           [](ModuleOp &self, ModuleOp &source) {
+             if (self == source)
+               throw std::runtime_error(
+                   "cannot merge Triton functions from a module into itself");
+             if (self.getContext() != source.getContext())
+               throw std::runtime_error(
+                   "cannot merge Triton functions from a different MLIR "
+                   "context");
+
+             SmallVector<FuncOp> functions;
+             for (FuncOp function : source.getOps<FuncOp>())
+               functions.push_back(function);
+             llvm::StringSet<> sourceNames;
+             for (FuncOp function : functions) {
+               StringRef name = function.getName();
+               if (!sourceNames.insert(name).second)
+                 throw std::runtime_error(
+                     ("source module contains duplicate Triton function '@" +
+                      name + "'")
+                         .str());
+               if (Operation *existing = self.lookupSymbol(name))
+                 throw std::runtime_error(
+                     ("destination module already contains symbol '@" + name +
+                      "' (" + existing->getName().getStringRef() + ")")
+                         .str());
+             }
+
+             Block *destination = self.getBody();
+             for (FuncOp function : functions)
+               function->moveBefore(destination, destination->end());
+           })
       .def("get_entry_func_name",
            [](ModuleOp &self) -> std::string {
              for (auto &op : self.getOps()) {
@@ -779,6 +940,7 @@ void init_triton_ir(py::module_ &m) {
              return py::int_(ret.getInt());
            })
       .def("get_tensordesc_metadata", getTensorDescMetadata)
+      .def("get_timely_plan_descriptor", getTimelyPlanDescriptor)
       .def("create_location_snapshot",
            [](ModuleOp &self, const std::string &fileName) -> void {
              auto printingFlags = getOpPrintingFlags();
@@ -799,15 +961,17 @@ void init_triton_ir(py::module_ &m) {
 
   m.def(
       "parse_mlir_module",
-      [](const std::string &inputFilename, MLIRContext &context) {
-        // parse module
+      [](const std::string &inputFilename, MLIRContext &context,
+         bool verifyAfterParse) {
+        ParserConfig config(&context, verifyAfterParse);
         OwningOpRef<ModuleOp> module =
-            parseSourceFile<ModuleOp>(inputFilename, &context);
+            parseSourceFile<ModuleOp>(inputFilename, config);
         if (!module)
           throw std::runtime_error("Parse MLIR file failed.");
         return module->clone();
       },
-      ret::move);
+      py::arg("input_filename"), py::arg("context"),
+      py::arg("verify_after_parse") = true, ret::move);
 
   m.def(
       "deduce_scale_factor",

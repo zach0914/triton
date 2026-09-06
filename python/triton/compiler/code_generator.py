@@ -295,7 +295,8 @@ class CodeGenerator(ast.NodeVisitor):
 
     def __init__(self, context, prototype, gscope, function_name, jit_fn: JITFunction, *, options, codegen_fns,
                  module_map, is_gluon, module=None, is_kernel=False, function_types: Optional[Dict] = None,
-                 noinline=False, caller_context=None, file_name: Optional[str] = None, begin_line=0, begin_col=1):
+                 noinline=False, caller_context=None, file_name: Optional[str] = None, begin_line=0, begin_col=1,
+                 visibility: Optional[str] = None):
         self.context = context
         self.is_gluon = is_gluon
         if is_gluon:
@@ -346,6 +347,7 @@ class CodeGenerator(ast.NodeVisitor):
             function_name = check_identifier_legality(function_name, "function")
         self.function_name = function_name
         self.is_kernel = is_kernel
+        self.visibility = visibility
         self.cur_node = None
         self.noinline = noinline
         self.caller_context = caller_context
@@ -672,7 +674,7 @@ class CodeGenerator(ast.NodeVisitor):
                 self.visiting_arg_default_value = False
 
         # initialize function
-        visibility = "public" if self.is_kernel else "private"
+        visibility = self.visibility or ("public" if self.is_kernel else "private")
         fn_ty = self.prototype.serialize(self.builder)
         self.fn = self.builder.get_or_insert_function(self.module, self.function_name, fn_ty, visibility, self.noinline)
         self.module.push_back(self.fn)
@@ -1732,7 +1734,8 @@ class CodeGenerator(ast.NodeVisitor):
     }
 
 
-def ast_to_ttir(fn, src, context, options, codegen_fns, module_map, module=None):
+def ast_to_ttir(fn, src, context, options, codegen_fns, module_map, module=None, *, function_name=None,
+                visibility=None, function_types=None, verify=True):
     arg_types = [None] * len(fn.arg_names)
 
     for k, v in src.signature.items():
@@ -1765,15 +1768,17 @@ def ast_to_ttir(fn, src, context, options, codegen_fns, module_map, module=None)
     constants = {fn.arg_names[i[0]]: src.constants[i] for i in leaves}
     signature = src.signature
     proxy = namedtuple("SpecializationProxy", ["constants", "signature"])(constants, signature)
-    generator = CodeGenerator(context, prototype, gscope=fn.get_capture_scope(), function_name=fn.repr(proxy),
+    function_name = fn.repr(proxy) if function_name is None else function_name
+    generator = CodeGenerator(context, prototype, gscope=fn.get_capture_scope(), function_name=function_name,
                               jit_fn=fn, is_kernel=True, file_name=fn.file_name, begin_line=fn.def_file_line_number,
                               begin_col=fn.def_file_col_number, options=options, codegen_fns=codegen_fns,
-                              module_map=module_map, module=module, is_gluon=fn.is_gluon())
+                              module_map=module_map, module=module, is_gluon=fn.is_gluon(),
+                              function_types=function_types, visibility=visibility)
     generator.visit(fn.parse())
     module = generator.module
     # module takes ownership of the context
     module.context = context
-    if not module.verify():
+    if verify and not module.verify():
         if not fn.is_gluon():
             print(module)
         raise RuntimeError("error encountered during parsing")

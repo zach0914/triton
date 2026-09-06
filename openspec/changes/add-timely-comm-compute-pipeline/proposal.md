@@ -6,10 +6,11 @@
 
 - 在 Triton Python 前端中增加最小 Timely DSL，支持一维无序 shard domain、作为一等公民的编译期调度常量、逻辑时间表达式、异步 `allgather_shard` 和 Triton 计算任务。
 - 在 Triton MLIR 中增加独立 TM Dialect，分别表示逻辑发射时间、通信完成事件、固有任务依赖和任务资源需求；计算区域直接承载并复用 TTIR。
-- 将逻辑时间解释为发射偏序而非执行顺序，对绝对时间做保序稠密化，并保持同时间独立操作可并发发射。
+- 将逻辑时间解释为发射偏序而非执行顺序，对绝对时间做保序稠密化；一个逻辑层只有在前一层至少一个任务完成后才开放，同层任务仍分别受数据依赖和资源条件约束。
 - 通过 SSA 数据流、通信计划语义和前端数据依赖 annotation 构建依赖图；无法证明或与时间偏序冲突的固有依赖直接报错。
 - 复用 Triton 的 memory-effect、alias、buffer-region 和 membar 分析能力，并在需要时扩展其接口以服务跨 task 依赖分析。
-- 将时间偏序、固有依赖和目标资源约束转换为确定性发射/资源计划；后端分别生成同步原语并分配 SM、线程和共享内存等物理资源。
+- 将时间偏序、固有依赖和简化资源约束转换为唯一的 native `tm.plan`；通过结构化 `PlanDescriptor` Python binding 驱动 reference/CUDA executor，不在 Python 中重复依赖或资源分析。
+- 当前 TM 高层只验证单任务资源请求，并采用按资源类别保守串行化的 MVP 策略；精确的 SM、线程和共享内存竞争留给后续更接近目标后端的阶段。
 - 将计算任务 outline 为 Triton kernel，将通信任务降到轻量异步 runtime plan，通过 stream/event 生成可执行 overlap。
 - 提供串行 reference、非法调度诊断和 overlap 检查，证明结果正确且通信与计算能够并发推进。
 - `timely/` 原型保持不变，仅作为设计与测试参考；正式实现不依赖其库、二进制或构建系统。

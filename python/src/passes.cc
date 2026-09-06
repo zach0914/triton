@@ -11,6 +11,7 @@
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonInstrument/Transforms/Passes.h"
+#include "triton/Dialect/Timely/Transforms/Passes.h"
 #include "triton/Target/LLVMIR/Passes.h"
 #include "triton/Tools/PluginUtils.h"
 #include <memory>
@@ -174,6 +175,18 @@ void init_gluon_passes(py::module_ &m) {
                      gluon::createGluonInferCoalescedEncodingsPass);
 }
 
+void init_timely_passes(py::module_ &m) {
+  using namespace mlir::triton::timely;
+  ADD_PASS_WRAPPER_0("add_normalize_issue_time",
+                     createTimelyNormalizeIssueTime);
+  ADD_PASS_WRAPPER_0("add_build_dependency_graph",
+                     createTimelyBuildDependencyGraph);
+  ADD_PASS_OPTION_WRAPPER_4("add_plan_resources", createTimelyPlanResources,
+                            int64_t, int64_t, int64_t, int64_t);
+  ADD_PASS_WRAPPER_0("add_materialize_synchronization",
+                     createTimelyMaterializeSynchronization);
+}
+
 } // namespace
 
 void init_triton_passes(py::module_ &m) {
@@ -191,6 +204,8 @@ void init_triton_passes(py::module_ &m) {
   init_triton_passes_llvmir(llvmir_m);
   auto gluon_m = m.def_submodule("gluon");
   init_gluon_passes(gluon_m);
+  auto timely_m = m.def_submodule("timely");
+  init_timely_passes(timely_m);
   auto plugin_m = m.def_submodule("plugin");
   init_plugin_passes(plugin_m);
 }

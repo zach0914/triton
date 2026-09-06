@@ -26,9 +26,13 @@
 - **WHEN** 多个操作具有相同的规范化逻辑时间
 - **THEN** 它们 SHALL 属于同一发射层，且系统 MUST NOT 因稳定输出顺序而增加语义依赖
 
+#### Scenario: Open a logical layer after predecessor progress
+- **WHEN** 某操作位于第一层之后的逻辑时间层
+- **THEN** 该层 SHALL 仅在前一逻辑层至少一个任务执行完成后开放，且 MUST NOT 等待前一层全部任务完成
+
 #### Scenario: Same-time issue with a blocked consumer
 - **WHEN** `allgather(1)` 与 `gemm(0)` 具有相同逻辑时间，而 `gemm(0)` 依赖尚未完成的 `allgather(0)`
-- **THEN** 两个操作 SHALL 均可在该发射层被提交，`allgather(1)` SHALL 可继续执行，而 `gemm(0)` SHALL 等待 `allgather(0)` 的完成依赖
+- **THEN** 前一层完成门槛满足后两个操作 SHALL 均可在该发射层被提交，且各自 SHALL 等待尚未满足的数据或资源前驱
 
 ### Requirement: Dependency identification and annotations
 系统 SHALL 将时间线与固有依赖建模为独立信息。系统 SHALL 从 SSA 数据消费和已知异步操作契约自动识别依赖，并 SHALL 允许前端通过数据访问或显式依赖 annotation 表达无法从 SSA 直接识别的通信、读写和跨任务依赖。
@@ -65,11 +69,11 @@
 - **THEN** 编译 SHALL 接受该程序，且 MUST NOT 以性能不优为由改变其语义
 
 ### Requirement: Resource-aware scheduling
-系统 SHALL 为任务保留资源需求，并由目标后端根据可用 SM、线程、共享内存和通信资源生成物理资源计划。资源容量冲突 SHALL 可以延迟或串行化实际执行，但 MUST NOT 删除固有依赖或改变逻辑发射偏序。
+系统 SHALL 为任务保留资源需求。当前 TM 高层 SHALL 验证单任务资源请求，并 MAY 采用同层、同资源类别保守串行化的简化策略以生成 `ResourceOrder`；精确资源竞争 SHALL 留给后续目标相关阶段。任何资源策略 MUST NOT 删除固有依赖或改变逻辑发射偏序。
 
-#### Scenario: Serialize tasks that exceed capacity
-- **WHEN** 同一发射层的可执行任务所需资源超过目标容量
-- **THEN** 后端 SHALL 生成满足容量限制的资源顺序，并保持任务的时间与数据依赖语义
+#### Scenario: Conservatively serialize one resource class
+- **WHEN** 同一发射层包含多个相同资源类别的任务
+- **THEN** MVP 资源 Pass MAY 生成确定性的保守资源顺序，并保持任务的时间与数据依赖语义
 
 #### Scenario: Reject an infeasible resource request
 - **WHEN** 单个任务的线程数或共享内存需求超过目标可表示上限
@@ -88,6 +92,17 @@
 #### Scenario: Build a pipelined plan
 - **WHEN** `LAG` 允许后续 shard 通信与先前 shard 计算在偏序上并发
 - **THEN** 执行计划 SHALL 将通信与计算放入独立异步执行序列，并仅在数据消费点建立必要等待
+
+### Requirement: Native plan as the sole source of truth
+系统 SHALL 按 `GraphBuilder -> TM MLIR -> native Pass -> tm.plan -> PlanDescriptor -> executor` 生成并执行计划。结构化 `PlanDescriptor` binding SHALL 暴露节点、发射层、`DataDep`、`ResourceOrder` 和同步记录；Python executor MUST NOT 重复执行依赖分析或资源分析。
+
+#### Scenario: Execute the native plan descriptor
+- **WHEN** 用户调用 `@tm.kernel.plan()` 或执行 reference/CUDA 计划
+- **THEN** 系统 SHALL 运行 native pass pipeline、从 `tm.plan` 构造 `PlanDescriptor`，并通过 task id 注册表解析 Triton 计算任务
+
+#### Scenario: Preserve all native plan relations
+- **WHEN** native `tm.plan` 包含发射层、数据边、资源边和同步记录
+- **THEN** Python binding SHALL 无损暴露这些结构，executor SHALL 只物化这些关系而 MUST NOT 推导新的语义边
 
 ### Requirement: Executable correctness and overlap
 系统 SHALL 能执行生成的 reference 计划，计算任务 MUST 通过标准 Triton 编译链生成，执行结果 MUST 与串行通信后计算 reference 一致。

@@ -24,6 +24,7 @@ from .errors import TritonError
 from .runtime._allocation import set_allocator
 
 from . import language
+from . import timely
 from . import testing
 from . import tools
 
@@ -56,6 +57,7 @@ __all__ = [
     "TensorWrapper",
     "TritonError",
     "testing",
+    "timely",
     "tools",
 ]
 
